@@ -49,7 +49,16 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
 	st.success(f"Uploaded: {uploaded_file.name}")
 	backtest_data = pd.read_csv(uploaded_file)
-	st.dataframe(backtest_data, hide_index=True)
+
+	required_columns = {"date", "strategy_return"}
+	missing_columns = required_columns - set(backtest_data.columns)
+
+	if missing_columns:
+		missing_text = ", ".join(sorted(missing_columns))
+		st.error(f"Missing required columns: {missing_text}")
+	else:
+		st.success("Schema check passed.")
+		st.dataframe(backtest_data, hide_index=True)
 
 
 
