@@ -34,3 +34,16 @@ st.metric(
 	f"${estimated_transaction_cost:,.2f}",
 	border=True,
 )
+
+
+st.divider()
+st.subheader("Upload backtest data")
+
+uploaded_file = st.file_uploader(
+	"Choose a CSV file",
+	type="csv",
+	help="Upload a CSV containing backtest returns.",
+)
+
+if uploaded_file is not None:
+	st.success(f"Uploaded: {uploaded_file.name}")
