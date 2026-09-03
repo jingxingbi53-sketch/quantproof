@@ -57,8 +57,29 @@ if uploaded_file is not None:
 		missing_text = ", ".join(sorted(missing_columns))
 		st.error(f"Missing required columns: {missing_text}")
 	else:
-		st.success("Schema check passed.")
-		st.dataframe(backtest_data, hide_index=True)
+		backtest_data["date"] = pd.to_datetime(
+			backtest_data["date"],
+			errors="coerce",
+		)
+		backtest_data["strategy_return"] = pd.to_numeric(
+			backtest_data["strategy_return"],
+			errors="coerce",
+		)
+		invalid_rows = backtest_data[
+			["date", "strategy_return"]
+		].isna().any(axis=1)
+		if invalid_rows.any():
+			invalid_count = int(invalid_rows.sum())
+			st.error(
+				f"Found {invalid_count} row(s) with invalid or missing values."
+			)
+			st.dataframe(
+				backtest_data.loc[invalid_rows],
+				hide_index=True,
+			)
+		else:
+			st.success("Data validation passed.")
+			st.dataframe(backtest_data, hide_index=True)
 
 
 
