@@ -1,3 +1,4 @@
+import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="QuantProof", page_icon="📊")
@@ -47,3 +48,8 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
 	st.success(f"Uploaded: {uploaded_file.name}")
+	backtest_data = pd.read_csv(uploaded_file)
+	st.dataframe(backtest_data, hide_index=True)
+
+
+
