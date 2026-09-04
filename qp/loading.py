@@ -23,6 +23,7 @@ RETURN_HINTS = (
     "return", "returns", "ret", "rets", "pnl", "p&l", "daily", "strategy",
     "profit", "change", "pct",
 )
+TURNOVER_HINTS = ("turnover", "turn", "traded", "trade_fraction")
 EQUITY_HINTS = (
     "nav", "equity", "cum", "value", "balance", "portfolio",
     "wealth", "capital",
@@ -64,6 +65,8 @@ class LoadedSeries:
     scale: str                # "decimal" or "percent"
     value_column: str
     date_column: str | None
+    turnover: pd.Series | None = None
+    turnover_column: str | None = None
     notes: list[str] = field(default_factory=list)
     hygiene: Hygiene = field(default_factory=Hygiene)
 
@@ -296,20 +299,21 @@ def infer_frequency(index: pd.DatetimeIndex) -> tuple[str, int]:
 # Assembly
 # ---------------------------------------------------------------------------
 
-def peek_frequency(df: pd.DataFrame) -> str:
-    """Guess the sampling frequency without doing the full conversion.
-
-    The app needs this before it draws the sidebar, so that a monthly file
-    arrives with a monthly cost assumption rather than a daily one.
-    """
-    date_col = guess_date_column(df)
-    if date_col is None:
-        return "Daily"
-    dates = _try_dates(df[date_col])
-    if dates is None:
-        return "Daily"
-    clean = pd.DatetimeIndex(dates.dropna().sort_values())
-    return infer_frequency(clean)[0]
+def guess_turnover_column(
+    df: pd.DataFrame,
+    exclude: tuple[str | None, ...] = (),
+) -> str | None:
+    """Find a turnover column, which upgrades the cost model when present."""
+    for col in df.columns:
+        if col in exclude:
+            continue
+        if _score_name(col, TURNOVER_HINTS) <= 0:
+            continue
+        values = coerce_numeric(df[col]).dropna()
+        # Turnover is a traded fraction: non-negative and rarely enormous.
+        if values.size >= 3 and bool((values >= 0).all()):
+            return str(col)
+    return None
 
 
 def build_series(
@@ -317,6 +321,7 @@ def build_series(
     *,
     value_col: str,
     date_col: str | None = None,
+    turnover_col: str | None = None,
     kind: str = "auto",
     scale: str = "auto",
     frequency: str = "auto",
@@ -449,6 +454,42 @@ def build_series(
     )
     hygiene.calendar_gaps = _count_gaps(pd.DatetimeIndex(returns.index))
 
+    # ---- optional turnover -----------------------------------------------
+    turnover = None
+    if turnover_col is not None and turnover_col in df.columns:
+        rates = coerce_numeric(df[turnover_col])
+        if used_date_col is not None:
+            stamps = _try_dates(df[used_date_col])
+            if stamps is not None:
+                paired = pd.DataFrame(
+                    {"turnover": rates.to_numpy(), "date": stamps.to_numpy()}
+                ).dropna(subset=["date"])
+                paired = paired.drop_duplicates(subset="date", keep="last")
+                rates = pd.Series(
+                    paired["turnover"].to_numpy(dtype=float),
+                    index=pd.DatetimeIndex(paired["date"]),
+                ).sort_index()
+                turnover = rates.reindex(returns.index)
+        else:
+            trimmed = rates.dropna().to_numpy(dtype=float)
+            if trimmed.size >= returns.size:
+                offset = trimmed.size - returns.size
+                turnover = pd.Series(
+                    trimmed[offset:], index=returns.index
+                )
+
+        if turnover is not None and float(turnover.notna().mean()) < 0.5:
+            turnover = None
+            notes.append(
+                "A turnover column was found but could not be matched to the"
+                " returns, so costs are charged at a flat rate per period."
+            )
+        elif turnover is not None:
+            notes.append(
+                "Using the turnover column to charge costs where they are"
+                " actually incurred, rather than at a flat rate per period."
+            )
+
     return LoadedSeries(
         returns=returns,
         periods_per_year=int(ppy),
@@ -457,6 +498,8 @@ def build_series(
         scale=resolved_scale,
         value_column=str(value_col),
         date_column=used_date_col,
+        turnover=turnover,
+        turnover_column=str(turnover_col) if turnover is not None else None,
         notes=notes,
         hygiene=hygiene,
     )

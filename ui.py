@@ -88,6 +88,9 @@ def analyse(
     cost_bps: float,
     confidence: float,
     n_boot: int,
+    max_plausible_sharpe: float,
+    turnover: pd.Series | None = None,
+    benchmark_returns: pd.Series | None = None,
 ) -> tuple[metrics.Performance, dict, diagnostics.Settings]:
     """Run the whole battery once per distinct set of assumptions."""
     cfg = diagnostics.Settings(
@@ -97,16 +100,31 @@ def analyse(
         confidence=confidence,
         n_boot=n_boot,
         cost_bps=cost_bps,
+        max_plausible_sharpe=max_plausible_sharpe,
     )
     perf = metrics.compute_performance(returns, periods_per_year, rf_annual)
-    diag = diagnostics.run_all(returns, periods_per_year, cfg)
+    diag = diagnostics.run_all(
+        returns,
+        periods_per_year,
+        cfg,
+        turnover=turnover,
+        benchmark_returns=benchmark_returns,
+    )
     return perf, diag, cfg
 
 
-def evaluate(loaded: LoadedSeries, **kwargs) -> tuple:
+def evaluate(
+    loaded: LoadedSeries,
+    benchmark_returns: pd.Series | None = None,
+    **kwargs,
+) -> tuple:
     """Analyse a loaded series and score it."""
     perf, diag, cfg = analyse(
-        loaded.returns, loaded.periods_per_year, **kwargs
+        loaded.returns,
+        loaded.periods_per_year,
+        turnover=loaded.turnover,
+        benchmark_returns=benchmark_returns,
+        **kwargs,
     )
     results = checks.run_checks(perf, diag, loaded, cfg)
     return perf, diag, cfg, results, scoring.score_checks(results)
@@ -337,6 +355,142 @@ def yearly_chart(yearly: pd.Series) -> alt.Chart:
             ],
         )
         .properties(height=CHART_HEIGHT)
+    )
+
+
+def dsr_curve_chart(
+    curve: pd.DataFrame,
+    reported_trials: int,
+    breakeven: int,
+    threshold: float,
+) -> alt.LayerChart:
+    """Deflated Sharpe against trial count, with the crossing point marked."""
+    colors = palette()
+    line = (
+        alt.Chart(curve)
+        .mark_line(color=colors["accent"], strokeWidth=2)
+        .encode(
+            x=alt.X(
+                "trials:Q",
+                scale=alt.Scale(type="log"),
+                axis=_axis(colors, "Strategies tried before this one"),
+            ),
+            y=alt.Y(
+                "dsr:Q",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=_axis(colors, "Deflated Sharpe", ".1f"),
+            ),
+            tooltip=[
+                alt.Tooltip("trials:Q", title="Trials", format=","),
+                alt.Tooltip("dsr:Q", title="Deflated Sharpe", format=".3f"),
+            ],
+        )
+    )
+    bar = (
+        alt.Chart(pd.DataFrame({"y": [threshold]}))
+        .mark_rule(color=colors["muted"], strokeDash=[4, 4], strokeWidth=1)
+        .encode(y="y:Q")
+    )
+    marks = [bar, line]
+    if breakeven > 0:
+        marks.append(
+            alt.Chart(pd.DataFrame({"x": [breakeven]}))
+            .mark_rule(color=colors["positive"], strokeWidth=2)
+            .encode(
+                x="x:Q",
+                tooltip=alt.Tooltip("x:Q", title="Survives to", format=","),
+            )
+        )
+    if reported_trials > 1:
+        marks.append(
+            alt.Chart(pd.DataFrame({"x": [reported_trials]}))
+            .mark_rule(color=colors["caution"], strokeWidth=2.5)
+            .encode(
+                x="x:Q",
+                tooltip=alt.Tooltip("x:Q", title="You reported", format=","),
+            )
+        )
+    return alt.layer(*marks).properties(height=CHART_HEIGHT)
+
+
+def window_heatmap(windows: pd.DataFrame) -> alt.Chart:
+    """Sharpe for every start and end date, as a diverging heatmap.
+
+    Polarity is the point -- whether a window makes or loses money -- so the
+    scale diverges from a neutral midpoint at zero rather than running through
+    a single hue.
+    """
+    colors = palette()
+    limit = float(
+        np.nanmax(np.abs(windows["sharpe"].to_numpy(dtype=float)))
+    ) if not windows.empty else 1.0
+
+    return (
+        alt.Chart(windows)
+        .mark_rect()
+        .encode(
+            x=alt.X("start:T", axis=_axis(colors, "Sample starts")),
+            y=alt.Y(
+                "end:T",
+                axis=_axis(colors, "Sample ends"),
+                sort="descending",
+            ),
+            color=alt.Color(
+                "sharpe:Q",
+                scale=alt.Scale(
+                    scheme="redyellowblue",
+                    domain=[-limit, limit],
+                    reverse=False,
+                ),
+                legend=alt.Legend(
+                    title="Sharpe",
+                    labelColor=colors["muted"],
+                    titleColor=colors["muted"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("start:T", title="From"),
+                alt.Tooltip("end:T", title="To"),
+                alt.Tooltip("sharpe:Q", title="Sharpe", format=".2f"),
+                alt.Tooltip("n:Q", title="Observations", format=","),
+            ],
+        )
+        .properties(height=320)
+    )
+
+
+def monthly_heatmap(grid: pd.DataFrame) -> alt.Chart:
+    """The classic year-by-month returns grid."""
+    colors = palette()
+    limit = float(
+        np.nanmax(np.abs(grid["return"].to_numpy(dtype=float)))
+    ) if not grid.empty else 0.1
+
+    return (
+        alt.Chart(grid)
+        .mark_rect(stroke=colors["surface"], strokeWidth=2)
+        .encode(
+            x=alt.X("month:O", axis=_axis(colors, "Month")),
+            y=alt.Y("year:O", axis=_axis(colors, "Year")),
+            color=alt.Color(
+                "return:Q",
+                scale=alt.Scale(
+                    scheme="redyellowgreen", domain=[-limit, limit]
+                ),
+                legend=alt.Legend(
+                    title="Return",
+                    format=".0%",
+                    labelColor=colors["muted"],
+                    titleColor=colors["muted"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("year:O", title="Year"),
+                alt.Tooltip("month:O", title="Month"),
+                alt.Tooltip("return:Q", title="Return", format=".2%"),
+            ],
+        )
+        .properties(height=max(160, 26 * grid["year"].nunique()))
     )
 
 

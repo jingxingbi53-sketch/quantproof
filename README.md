@@ -16,9 +16,26 @@ Live app: <https://quantproof-bobby.streamlit.app>
 | Category | Checks |
 | --- | --- |
 | Statistical significance | Sample size, Probabilistic Sharpe Ratio, minimum track record length |
-| Overfitting risk | Deflated Sharpe Ratio, Sharpe plausibility, return-vs-drawdown, reshuffled drawdowns |
+| Overfitting risk | Deflated Sharpe Ratio, alpha vs beta, sample-window sensitivity, Sharpe plausibility, return-vs-drawdown, reshuffled drawdowns |
 | Fragility | Return smoothing (autocorrelation), profit concentration, tail shape, cost sensitivity, sub-period stability, rolling consistency |
 | Data quality | Stale prices, exact zeros, duplicate timestamps, calendar gaps, over-rounding |
+
+Three of these do work nothing else here does:
+
+- **Breakeven trials.** The deflated Sharpe ratio depends entirely on how many
+  variants you tried, and asking for that number invites the flattering answer.
+  QuantProof inverts it and reports the trial count at which your Sharpe stops
+  being distinguishable from the best of that many random attempts. You are
+  never asked to grade your own search — only to judge whether it was wider
+  than the number on screen.
+- **Alpha versus beta.** Give it a benchmark and it regresses the strategy on
+  it with Newey-West standard errors, then re-runs the whole battery on the
+  hedged residual. Without this, a 1.2 Sharpe that is 0.8 beta to the equity
+  market passes every other test on the page.
+- **Sample-window sensitivity.** The Sharpe is recomputed over every start and
+  end date on a grid. Nothing else catches a date range chosen with hindsight;
+  the reshuffle test varies the order of returns inside a fixed window, which
+  is a different question.
 
 The statistics come from the literature rather than from folklore:
 
@@ -28,7 +45,9 @@ The statistics come from the literature rather than from folklore:
 - Bailey & López de Prado (2012, 2014) — the Probabilistic and Deflated Sharpe
   Ratios, and minimum track record length.
 - Getmansky, Lo & Makarov (2004) — return smoothing in illiquid portfolios.
+- Harvey & Liu (2015) — the multiple-testing haircut on a Sharpe ratio.
 - Politis & Romano (1994) — block bootstrap resampling.
+- Newey & West (1994) — automatic lag selection for the HAC estimators.
 
 The **Methodology** page in the app states every formula, and is explicit about
 what a return series cannot reveal: survivorship bias, look-ahead bias baked
@@ -42,7 +61,10 @@ One row per period, in CSV or Excel. QuantProof detects:
   holds the numbers;
 - whether the numbers are period returns or a cumulative equity/NAV curve;
 - whether returns are decimals (`0.0123`) or percentage points (`1.23`, `1.23%`);
-- the sampling frequency (daily, weekly, monthly, quarterly, annual).
+- the sampling frequency (daily, weekly, monthly, quarterly, annual);
+- an optional `turnover` column, which upgrades the cost model from a flat
+  per-period drag to `net = gross - turnover x cost`;
+- an optional benchmark column, or a second uploaded file.
 
 It copes with `$1,234.56`, `(0.5)` for negatives, semicolon and tab delimiters,
 unsorted rows, duplicate timestamps, and files with no date column at all.
@@ -60,10 +82,13 @@ uploading anything:
 
 | Example | What it is | Expected verdict |
 | --- | --- | --- |
-| Diversified trend follower | Eight years, Sharpe ≈ 0.9, real drawdowns | Credible (96) |
+| Diversified trend follower | Eight years, Sharpe ≈ 0.9, real drawdowns | Credible (97) |
 | Best of 500 parameter sets | The winner of a sweep over pure noise | Weak evidence (41) |
 | Illiquid credit fund | A real edge, reported on smoothed monthly marks | Weak evidence (50) |
 | Signal with a look-ahead bug | Sharpe 10.8, 3.4% max drawdown | Do not trust (16) |
+
+The overfit sweep is the clearest demonstration: it survives up to **3 trials**
+and was picked from 500.
 
 The last one is the point of the whole app: it is overwhelmingly significant by
 every classical test and still worthless.
@@ -91,6 +116,8 @@ qp/                    Analytics, with no Streamlit dependency
   loading.py           File parsing and format detection
   metrics.py           Descriptive performance statistics
   diagnostics.py       Inference and fragility tests
+  benchmark.py         Newey-West regression, alpha and the hedged stream
+  context.py           Asset-class priors for plausibility and cost
   checks.py            Diagnostics turned into pass / caution / fail
   scoring.py           Trust score and verdict
   samples.py           The four worked examples
@@ -127,3 +154,9 @@ Uploaded files are held in memory for the session and never written to disk.
 A high score means a track record is internally consistent and statistically
 supported. It is not a recommendation, and it is not investment advice. The
 most expensive backtest errors happen before the return series exists.
+
+The trust score itself deserves suspicion. Its weights were chosen by hand and
+calibrated against nothing, the checks are not independent, and any single
+number invites people to optimise against it — which is the exact pathology
+this app exists to detect. Read the individual checks. The score is a summary
+for people who will not.

@@ -243,6 +243,16 @@ def check_dsr(
     dsr = diag["dsr"]
     n_trials = diag["n_trials"]
     hurdle = diag["dsr_benchmark_annual"]
+    survives = diag["breakeven_trials"]
+
+    survives_text = (
+        "This record would stop being distinguishable from search at about "
+        f"{survives:,} trials, so the question is simply whether your own "
+        "search was wider than that."
+        if survives > 0
+        else "This record does not clear the bar even as a single untested "
+             "hypothesis, so the trial count is not what is wrong with it."
+    )
 
     if not np.isfinite(dsr):
         status, score = SKIP, 0.5
@@ -269,16 +279,16 @@ def check_dsr(
         status=status,
         score=float(score),
         weight=2.0,
-        headline=f"DSR = {_num(dsr)} after accounting for {n_trials:,} "
-                 f"trial(s)",
+        headline=f"Survives up to {survives:,} trials; you reported "
+                 f"{n_trials:,}",
         detail=(
             f"This is the single most important number on the page. Search "
             f"enough parameter combinations and one of them will look "
             f"excellent by chance. The Deflated Sharpe Ratio raises the bar "
             f"to the Sharpe that pure search would have produced, then asks "
-            f"whether yours still clears it. {trials_text} Trial-to-trial "
-            f"Sharpe dispersion was estimated at "
-            f"{_num(diag['trial_dispersion_annual'])} from the "
+            f"whether yours still clears it. {trials_text} {survives_text} "
+            f"Trial Sharpe dispersion was taken as "
+            f"{_num(diag['trial_dispersion_annual'])}: the "
             f"{diag['trial_dispersion_source']}."
         ),
         advice=(
@@ -298,12 +308,15 @@ def check_sharpe_prior(
     cfg: Settings,
 ) -> Check:
     sr = perf.sharpe
+    ceiling = float(cfg.max_plausible_sharpe)
+    hard = ceiling * 1.6
+
     if not np.isfinite(sr):
         status, score = SKIP, 0.5
-    elif sr > 4.0:
+    elif sr > hard:
         status, score = FAIL, 0.0
-    elif sr > 2.5:
-        status, score = WARN, 0.35 + 0.3 * _ramp(4.0 - sr, 0.0, 1.5)
+    elif sr > ceiling:
+        status, score = WARN, 0.35 + 0.3 * _ramp(hard - sr, 0.0, hard - ceiling)
     elif sr < 0:
         status, score = FAIL, 0.0
     else:
@@ -318,11 +331,13 @@ def check_sharpe_prior(
         weight=1.5,
         headline=f"Annualised Sharpe of {_num(sr)}",
         detail=(
-            "Published equity factors sit near 0.3–0.6. Good systematic "
-            "strategies run 0.8–1.5. Sustained Sharpes above 2 exist, but "
-            "almost always in capacity-constrained, high-frequency niches "
-            "with real infrastructure behind them. A large number from a "
-            "simple daily backtest is far more often a bug than an edge."
+            f"Judged against a ceiling of {_num(ceiling)} for this asset "
+            f"class and horizon. Published equity factors sit near 0.3–0.6 "
+            f"and good systematic strategies run 0.8–1.5, but a "
+            f"capacity-constrained market-making book legitimately runs far "
+            f"higher, which is why this ceiling is a setting rather than a "
+            f"constant. Set the context in the sidebar if it is wrong: a "
+            f"real edge should not be failed for being fast."
         ),
         advice=(
             "The magnitude is in a believable range."
@@ -380,6 +395,131 @@ def check_calmar(
             else "Check the exact timestamp your signal is computed on versus "
                  "the price it trades at. An off-by-one bar is the single "
                  "most common cause of a curve this clean."
+        ),
+    )
+
+
+def check_window_sensitivity(
+    perf: Performance,
+    diag: dict,
+    loaded: LoadedSeries,
+    cfg: Settings,
+) -> Check:
+    summary = diag["window_summary"]
+    share = summary["share_above_half"]
+    worst, best = summary["worst"], summary["best"]
+
+    if not summary["n_windows"] or not np.isfinite(share):
+        status, score = SKIP, 0.5
+    elif share < 0.45:
+        status, score = FAIL, 0.3 * _ramp(share, 0.0, 0.45)
+    elif share < 0.70:
+        status, score = WARN, 0.3 + 0.5 * _ramp(share, 0.45, 0.70)
+    else:
+        status, score = PASS, 0.8 + 0.2 * _ramp(share, 0.70, 0.95)
+
+    return Check(
+        key="window_sensitivity",
+        name="Sample window sensitivity",
+        category="Overfitting risk",
+        status=status,
+        score=float(score),
+        weight=1.25,
+        headline=(
+            f"Across {summary['n_windows']:,} sub-windows the Sharpe ranges "
+            f"from {_num(worst)} to {_num(best)}"
+        ),
+        detail=(
+            f"Recomputing the Sharpe over every start and end date shows "
+            f"whether the headline number depends on where the sample happens "
+            f"to begin. {_pct(share, 0)} of sub-windows keep at least half of "
+            f"the reported {_num(perf.sharpe)}, and the median sub-window "
+            f"gives {_num(summary['median'])}. Nothing else in this battery "
+            f"catches a date range chosen with hindsight: the reshuffle test "
+            f"varies the order of returns inside a fixed window, which is a "
+            f"different question."
+        ),
+        advice=(
+            "The result does not depend on where the sample starts or ends."
+            if status == PASS
+            else "Check whether the start date was chosen after seeing the "
+                 "data. A result that needs one particular window is a "
+                 "statement about that window, not about the strategy."
+        ),
+    )
+
+
+def check_alpha(
+    perf: Performance,
+    diag: dict,
+    loaded: LoadedSeries,
+    cfg: Settings,
+) -> Check:
+    attribution = diag.get("attribution")
+
+    if attribution is None:
+        return Check(
+            key="alpha",
+            name="Alpha versus the benchmark",
+            category="Overfitting risk",
+            status=SKIP,
+            score=0.5,
+            weight=1.75,
+            headline="No benchmark supplied",
+            detail=(
+                "Without a benchmark this battery cannot tell an edge from "
+                "leverage. A Sharpe of 1.2 that is 0.8 beta to the equity "
+                "market will pass every other test on this page, because "
+                "every other test only looks at the return series in "
+                "isolation. This is the largest blind spot in the analysis."
+            ),
+            advice=(
+                "Add a benchmark column, or upload a second file with the "
+                "benchmark's returns, and this check will separate the two."
+            ),
+        )
+
+    t_stat = attribution.alpha_t
+    beta, r2 = attribution.beta, attribution.r_squared
+
+    if not np.isfinite(t_stat):
+        status, score = SKIP, 0.5
+    elif t_stat >= 2.5:
+        status, score = PASS, 0.85 + 0.15 * _ramp(t_stat, 2.5, 4.0)
+    elif t_stat >= 1.65:
+        status, score = WARN, 0.4 + 0.45 * _ramp(t_stat, 1.65, 2.5)
+    else:
+        status, score = FAIL, 0.4 * _ramp(t_stat, 0.0, 1.65)
+
+    return Check(
+        key="alpha",
+        name="Alpha versus the benchmark",
+        category="Overfitting risk",
+        status=status,
+        score=float(score),
+        weight=1.75,
+        headline=(
+            f"Alpha {_pct(attribution.alpha_annual)} a year, t = "
+            f"{_num(t_stat)}, beta {_num(beta)}"
+        ),
+        detail=(
+            f"Regressing the strategy on the benchmark leaves "
+            f"{_pct(attribution.alpha_annual)} a year of alpha with a "
+            f"Newey-West t-statistic of {_num(t_stat)} at "
+            f"{attribution.nw_lags} lags, which corrects for the "
+            f"autocorrelation that would otherwise overstate significance. "
+            f"The benchmark explains {_pct(r2, 0)} of the variance. Hedging "
+            f"it out takes the Sharpe from "
+            f"{_num(attribution.strategy_sharpe)} to "
+            f"{_num(attribution.hedged_sharpe)} — that hedged number is the "
+            f"one worth paying for."
+        ),
+        advice=(
+            "The edge survives once the benchmark is taken away."
+            if status == PASS
+            else "Most of this return is the benchmark. Compare the hedged "
+                 "Sharpe against simply holding the benchmark at the same "
+                 "volatility, which is cheaper and needs no research."
         ),
     )
 
@@ -582,6 +722,21 @@ def check_costs(
     # run_all always prices the configured level, so it is in the curve.
     net = costs["curve"][assumed]
 
+    if costs["model"] == "turnover":
+        model_text = (
+            f"Costs are charged against the turnover column, so a period that "
+            f"traded nothing pays nothing. Average turnover is "
+            f"{_pct(costs['mean_turnover'])} per "
+            f"{PERIOD_NOUN.get(loaded.frequency_label, 'period')}, or "
+            f"{_num(costs['annual_turnover'])}x the book a year."
+        )
+    else:
+        model_text = (
+            "With no turnover column the cost is a flat drag on every period, "
+            "which assumes constant trading and is only a rough proxy. Add a "
+            "turnover column and this becomes a real estimate."
+        )
+
     breakeven = costs["breakeven_bps"]
     usable = np.isfinite(gross) and gross > 0
     retained = float(net / gross) if usable else float("nan")
@@ -605,11 +760,11 @@ def check_costs(
         headline=f"At {assumed:.1f} bps per period, Sharpe {_num(gross)} "
                  f"becomes {_num(net)}",
         detail=(
-            f"The strategy breaks even at {breakeven:.2f} bps of cost per "
-            f"{PERIOD_NOUN.get(loaded.frequency_label, 'period')} — that is "
-            f"the entire budget available for spread, slippage, commission, "
-            f"borrow and market impact. Most backtests are gross of all of "
-            f"it."
+            f"{model_text} The strategy breaks even at {breakeven:.2f} bps of "
+            f"cost per {PERIOD_NOUN.get(loaded.frequency_label, 'period')} — "
+            f"that is the entire budget available for spread, slippage, "
+            f"commission, borrow and market impact. Most backtests are gross "
+            f"of all of it."
         ),
         advice=(
             "The edge is large relative to plausible trading friction."
@@ -799,6 +954,8 @@ CHECK_FUNCS = (
     check_dsr,
     check_sharpe_prior,
     check_calmar,
+    check_alpha,
+    check_window_sensitivity,
     check_drawdown_plausibility,
     check_autocorrelation,
     check_concentration,

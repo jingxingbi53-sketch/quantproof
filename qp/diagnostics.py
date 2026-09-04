@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from . import benchmark as bm
 from . import metrics
 
 EULER_GAMMA = 0.5772156649015329
@@ -136,36 +137,232 @@ def deflated_sharpe_ratio(
     return dsr, benchmark
 
 
+def breakeven_trials(
+    sr_period: float,
+    n: int,
+    skew: float,
+    kurtosis: float,
+    trial_sharpe_std_period: float,
+    threshold: float = 0.95,
+    ceiling: int = 1_000_000,
+) -> int:
+    """The largest number of trials this Sharpe would still survive.
+
+    Asking a researcher how many variants they tried invites the flattering
+    answer, and the deflated Sharpe ratio is only as honest as that number.
+    Inverting the question removes the incentive: the deflated Sharpe falls
+    monotonically in the trial count, so there is a unique point where it
+    crosses the threshold. Reporting *that* leaves the user to judge whether
+    their own search was larger, which is a question they can answer without
+    having to grade themselves.
+
+    Returns 0 when the result fails even as a single untested hypothesis.
+    """
+    def survives(trials: int) -> bool:
+        dsr, _ = deflated_sharpe_ratio(
+            sr_period, n, skew, kurtosis, trials, trial_sharpe_std_period
+        )
+        return bool(np.isfinite(dsr) and dsr >= threshold)
+
+    if not survives(1):
+        return 0
+    if survives(ceiling):
+        return ceiling
+
+    low, high = 1, ceiling
+    while high - low > 1:
+        middle = (low + high) // 2
+        if survives(middle):
+            low = middle
+        else:
+            high = middle
+    return int(low)
+
+
+def dsr_curve(
+    sr_period: float,
+    n: int,
+    skew: float,
+    kurtosis: float,
+    trial_sharpe_std_period: float,
+    max_trials: int = 10_000,
+) -> pd.DataFrame:
+    """Deflated Sharpe as a function of the trial count, for plotting."""
+    grid = np.unique(
+        np.round(np.geomspace(1, max(2, max_trials), 90)).astype(int)
+    )
+    rows = [
+        {
+            "trials": int(trials),
+            "dsr": deflated_sharpe_ratio(
+                sr_period, n, skew, kurtosis, int(trials),
+                trial_sharpe_std_period,
+            )[0],
+        }
+        for trials in grid
+    ]
+    return pd.DataFrame(rows)
+
+
+def haircut_sharpe(
+    sr_annual: float,
+    n: int,
+    periods_per_year: int,
+    n_trials: int,
+) -> dict:
+    """Harvey and Liu's (2015) multiple-testing haircut on a Sharpe ratio.
+
+    The observed Sharpe implies a t-statistic; that t-statistic implies a
+    p-value; the p-value is corrected for having been the best of ``n_trials``
+    attempts, and the corrected p-value is turned back into a Sharpe. The
+    result is the Sharpe that carries the same evidential weight *after*
+    admitting how hard the researcher looked.
+
+    A Bonferroni correction is used, which is the conservative end of Harvey
+    and Liu's three adjustments: it assumes the trials were independent, and
+    correlated trials would be penalised less. This is an adjustment for
+    selection, not a forecast of future performance.
+    """
+    if n < 3 or not np.isfinite(sr_annual):
+        return {"haircut_sharpe": float("nan"), "haircut": float("nan")}
+
+    years = n / float(periods_per_year)
+    t_stat = float(sr_annual * np.sqrt(years))
+    if t_stat <= 0:
+        return {
+            "haircut_sharpe": float(min(sr_annual, 0.0)),
+            "haircut": 1.0,
+            "t_stat": t_stat,
+            "p_value": 1.0,
+            "p_adjusted": 1.0,
+        }
+
+    p_value = float(2.0 * stats.t.sf(t_stat, df=max(1, n - 1)))
+    p_adjusted = float(min(1.0, p_value * max(1, n_trials)))
+
+    # Invert back to a t-statistic, then to a Sharpe on the same horizon.
+    t_adjusted = float(stats.t.isf(p_adjusted / 2.0, df=max(1, n - 1)))
+    t_adjusted = max(t_adjusted, 0.0)
+    adjusted = float(t_adjusted / np.sqrt(years))
+
+    return {
+        "haircut_sharpe": adjusted,
+        "haircut": float(1.0 - adjusted / sr_annual) if sr_annual > 0 else 1.0,
+        "t_stat": t_stat,
+        "p_value": p_value,
+        "p_adjusted": p_adjusted,
+    }
+
+
+def window_sensitivity(
+    returns: pd.Series,
+    periods_per_year: int,
+    grid: int = 26,
+) -> pd.DataFrame:
+    """Annualised Sharpe over every start and end date on a coarse grid.
+
+    Nothing else in the battery catches a sample window chosen with hindsight.
+    The permutation test reshuffles returns inside a fixed window, which is a
+    different question entirely. Recomputing the Sharpe over every sub-window
+    shows immediately whether the headline number depends on where the sample
+    happens to begin and end.
+
+    Prefix sums make each window O(1), so the whole grid is cheap.
+    """
+    arr = returns.to_numpy(dtype=float)
+    n = arr.size
+    index = pd.DatetimeIndex(returns.index)
+    minimum = max(20, min(periods_per_year, n // 5))
+    if n < minimum * 2:
+        return pd.DataFrame(
+            columns=["start", "end", "sharpe", "n", "start_i", "end_i"]
+        )
+
+    cumulative = np.concatenate([[0.0], np.cumsum(arr)])
+    squared = np.concatenate([[0.0], np.cumsum(arr ** 2)])
+    scale = np.sqrt(periods_per_year)
+
+    starts = np.unique(np.linspace(0, n - minimum, grid).astype(int))
+    ends = np.unique(np.linspace(minimum, n, grid).astype(int))
+
+    rows = []
+    for start in starts:
+        for end in ends:
+            length = int(end - start)
+            if length < minimum:
+                continue
+            total = cumulative[end] - cumulative[start]
+            total_sq = squared[end] - squared[start]
+            mean = total / length
+            variance = (total_sq - length * mean ** 2) / (length - 1)
+            sharpe = (
+                float(mean / np.sqrt(variance) * scale)
+                if variance > 0
+                else float("nan")
+            )
+            rows.append(
+                {
+                    "start": index[int(start)],
+                    "end": index[int(end) - 1],
+                    "sharpe": sharpe,
+                    "n": length,
+                    "start_i": int(start),
+                    "end_i": int(end),
+                }
+            )
+
+    frame = pd.DataFrame(rows)
+    return frame.dropna(subset=["sharpe"])
+
+
+def window_summary(frame: pd.DataFrame, observed: float) -> dict:
+    """Condense the window grid into the few numbers worth reporting."""
+    if frame.empty:
+        return {
+            "n_windows": 0,
+            "share_positive": float("nan"),
+            "worst": float("nan"),
+            "best": float("nan"),
+            "median": float("nan"),
+            "share_above_half": float("nan"),
+        }
+    values = frame["sharpe"].to_numpy(dtype=float)
+    reference = observed / 2.0 if np.isfinite(observed) else 0.0
+    return {
+        "n_windows": int(values.size),
+        "share_positive": float(np.mean(values > 0)),
+        "worst": float(np.min(values)),
+        "best": float(np.max(values)),
+        "median": float(np.median(values)),
+        "share_above_half": float(np.mean(values >= reference)),
+    }
+
+
 def trial_sharpe_dispersion(
     returns: pd.Series,
     periods_per_year: int,
-) -> tuple[float, str]:
+) -> tuple[float, str, float]:
     """Estimate the spread of Sharpe ratios across the trials that were run.
 
-    The Deflated Sharpe Ratio needs the variance of the trial Sharpes, which no
-    upload can contain. The best available proxy is how much this strategy's own
-    Sharpe moves between non-overlapping years; if there are too few years, fall
-    back to the estimator's own standard error, which is the conservative floor.
-    Returns the annualised dispersion and a label describing where it came from.
+    The Deflated Sharpe Ratio needs the variance of the trial Sharpes, which a
+    single uploaded series cannot contain. Under the null the correction is
+    built on -- every trial worthless -- the trial Sharpes differ only by
+    estimation error, so their standard deviation *is* the standard error of a
+    full-sample Sharpe estimate. That is the quantity used here.
+
+    An earlier version used the spread of this strategy's own year-by-year
+    Sharpe ratios, which is wrong in a way worth recording: yearly estimates
+    carry roughly sqrt(years) times the noise of a full-sample estimate, so it
+    overstated the dispersion badly and deflated even honest records into
+    nothing. The year-by-year figure is still returned, because a spread far
+    wider than estimation error hints at a strategy whose behaviour changes
+    regime to regime.
+
+    Real trials differ in quality as well as in luck, so genuine dispersion is
+    wider than this and the deflation here is the gentler end of the range.
     """
     arr = returns.to_numpy(dtype=float)
     n, ppy = arr.size, int(periods_per_year)
-    blocks = [arr[i:i + ppy] for i in range(0, n, ppy)]
-    usable = [b for b in blocks if b.size >= max(6, ppy // 4)]
-
-    sharpes = []
-    for block in usable:
-        sd = float(np.std(block, ddof=1))
-        if sd > 0:
-            sharpes.append(float(np.mean(block) / sd * np.sqrt(ppy)))
-
-    if len(sharpes) >= 3:
-        dispersion = float(np.std(np.asarray(sharpes), ddof=1))
-        if dispersion > 0:
-            return dispersion, (
-                "spread of this strategy's own year-by-year"
-                " Sharpe ratios"
-            )
 
     sd = float(np.std(arr, ddof=1))
     sr_p = float(np.mean(arr) / sd) if sd > 0 else 0.0
@@ -176,11 +373,26 @@ def trial_sharpe_dispersion(
         else 3.0
     )
     se = sharpe_standard_error(sr_p, n, skew, kurt)
-    fallback = float(se * np.sqrt(ppy)) if np.isfinite(se) else 0.5
-    return max(fallback, 1e-6), (
-        "standard error of this Sharpe estimate (too few years to"
-        " measure it directly)"
+    estimate = float(se * np.sqrt(ppy)) if np.isfinite(se) else 0.5
+
+    blocks = [arr[i:i + ppy] for i in range(0, n, ppy)]
+    usable = [b for b in blocks if b.size >= max(6, ppy // 4)]
+    yearly = []
+    for block in usable:
+        block_sd = float(np.std(block, ddof=1))
+        if block_sd > 0:
+            yearly.append(float(np.mean(block) / block_sd * np.sqrt(ppy)))
+    spread = (
+        float(np.std(np.asarray(yearly), ddof=1))
+        if len(yearly) >= 3
+        else float("nan")
     )
+
+    label = (
+        "standard error of a full-sample Sharpe estimate, which is how far"
+        " apart worthless trials land by luck alone"
+    )
+    return max(estimate, 1e-6), label, spread
 
 
 # ---------------------------------------------------------------------------
@@ -218,33 +430,56 @@ def ljung_box(
     return q, p, h
 
 
+def hac_bandwidth(n: int) -> int:
+    """Newey and West's (1994) automatic lag choice, 4(T/100)^(2/9)."""
+    if n < 8:
+        return 1
+    return int(max(1, np.floor(4.0 * (n / 100.0) ** (2.0 / 9.0))))
+
+
 def lo_annualisation_factor(
     returns: pd.Series,
     periods_per_year: int,
-    max_lag: int = 10,
-) -> float:
+    max_lag: int | None = None,
+) -> tuple[float, int]:
     """Lo's (2002) correct scaling factor, which replaces the naive sqrt(q).
 
     Positively autocorrelated returns compound their risk faster than the
     square-root rule assumes, so the naive annualised Sharpe is overstated.
-    Autocorrelations beyond ``max_lag`` are treated as zero.
+
+    Lo's formula sums over all q-1 lags. For daily data that is 251 sample
+    autocorrelations estimated from the same series, most of them noise, so
+    the sum is truncated at a Newey-West bandwidth and the remaining lags are
+    treated as zero. Bartlett weights taper the retained lags, which keeps the
+    variance estimate positive.
+
+    The truncation is deliberately conservative: a series with dependence
+    running past the bandwidth is corrected *less* than it should be, so the
+    adjusted Sharpe reported here is an upper bound on the honest one. The lag
+    count is returned so the app can say what it used.
     """
     q = float(periods_per_year)
     if q <= 1:
-        return 1.0
-    rho = autocorrelations(returns, min(max_lag, int(q) - 1))
+        return 1.0, 0
+
+    n = int(returns.size)
+    lags = int(max_lag) if max_lag else hac_bandwidth(n)
+    lags = int(max(1, min(lags, int(q) - 1, max(1, n // 4))))
+
+    rho = autocorrelations(returns, lags)
     ks = np.arange(1, rho.size + 1)
-    denom = q + 2.0 * float(np.sum((q - ks) * rho))
+    taper = 1.0 - ks / (rho.size + 1.0)
+    denom = q + 2.0 * float(np.sum(taper * (q - ks) * rho))
     if denom <= 0:
-        return float("nan")
-    return float(q / np.sqrt(denom))
+        return float("nan"), lags
+    return float(q / np.sqrt(denom)), lags
 
 
 def smoothing_profile(returns: pd.Series, periods_per_year: int) -> dict:
     """Autocorrelation summary plus the Sharpe it would survive at."""
     rho = autocorrelations(returns, 10)
     q_stat, p_value, lags = ljung_box(returns, 10)
-    factor = lo_annualisation_factor(returns, periods_per_year)
+    factor, lo_lags = lo_annualisation_factor(returns, periods_per_year)
     sr_p = metrics.sharpe_per_period(returns, periods_per_year)
     naive = float(sr_p * np.sqrt(periods_per_year))
     adjusted = float(sr_p * factor) if np.isfinite(factor) else float("nan")
@@ -254,6 +489,7 @@ def smoothing_profile(returns: pd.Series, periods_per_year: int) -> dict:
         "ljung_box_q": q_stat,
         "ljung_box_p": p_value,
         "ljung_box_lags": lags,
+        "lo_lags": lo_lags,
         "naive_sharpe": naive,
         "adjusted_sharpe": adjusted,
         "sharpe_inflation": (
@@ -273,6 +509,31 @@ def _chunk_sizes(total: int, chunk: int) -> list[int]:
     return [chunk] * full + ([rest] if rest else [])
 
 
+def dependence_block_length(returns: pd.Series) -> int:
+    """Block length scaled to how far this series' dependence actually runs.
+
+    A fixed n**(1/3) block is right only for a series with no memory. Blocks
+    have to be long enough to span the dependence they are meant to preserve,
+    so the base rate is multiplied by the integrated autocorrelation time,
+    tau = 1 + 2 * sum(rho_k), which is the factor by which serial correlation
+    inflates the variance of a sample mean.
+
+    This is a documented heuristic rather than the Politis-White plug-in rule;
+    it is transparent, it moves in the right direction with the data, and the
+    app lets the user override it.
+    """
+    n = int(returns.size)
+    if n < 20:
+        return 1
+    rho = autocorrelations(returns, hac_bandwidth(n))
+    ks = np.arange(1, rho.size + 1)
+    taper = 1.0 - ks / (rho.size + 1.0)
+    tau = 1.0 + 2.0 * float(np.sum(taper * rho))
+    tau = float(np.clip(tau, 1.0, 25.0))
+    base = n ** (1.0 / 3.0)
+    return int(max(2, min(round(tau * base), n // 4)))
+
+
 def bootstrap_sharpe(
     returns: pd.Series,
     periods_per_year: int,
@@ -290,7 +551,7 @@ def bootstrap_sharpe(
     if n < 10:
         return {"samples": np.array([]), "block": 0, "n_boot": 0}
 
-    size = int(block or max(2, round(n ** (1.0 / 3.0))))
+    size = int(block) if block else dependence_block_length(returns)
     size = max(1, min(size, n))
     n_blocks = int(np.ceil(n / size))
     rng = np.random.default_rng(seed)
@@ -312,13 +573,38 @@ def bootstrap_sharpe(
     if samples.size == 0:
         return {"samples": samples, "block": size, "n_boot": 0}
 
+    # A plain percentile interval is biased whenever the bootstrap
+    # distribution is not centred on the observed statistic, which for the
+    # Sharpe ratio it usually is not. Bias correction shifts the quantiles by
+    # the median bias the resamples reveal (Efron's BC interval; the
+    # acceleration term of BCa would need a jackknife over every observation,
+    # which is not worth the cost here).
+    observed = metrics.sharpe_ratio(returns, periods_per_year)
+    below = float(np.mean(samples < observed))
+    lo_pct, hi_pct = 5.0, 95.0
+    z0 = float("nan")
+    if 0.0 < below < 1.0:
+        z0 = float(stats.norm.ppf(below))
+        for target, name in ((0.05, "lo"), (0.95, "hi")):
+            z = float(stats.norm.ppf(target))
+            corrected = float(stats.norm.cdf(2.0 * z0 + z)) * 100.0
+            corrected = float(np.clip(corrected, 0.1, 99.9))
+            if name == "lo":
+                lo_pct = corrected
+            else:
+                hi_pct = corrected
+
     return {
         "samples": samples,
         "block": size,
         "n_boot": int(samples.size),
-        "p05": float(np.percentile(samples, 5)),
+        "observed": observed,
+        "bias_z0": z0,
+        "lo_pct": lo_pct,
+        "hi_pct": hi_pct,
+        "p05": float(np.percentile(samples, lo_pct)),
         "p50": float(np.percentile(samples, 50)),
-        "p95": float(np.percentile(samples, 95)),
+        "p95": float(np.percentile(samples, hi_pct)),
         "prob_positive": float(np.mean(samples > 0)),
     }
 
@@ -418,15 +704,49 @@ def cost_sensitivity(
     returns: pd.Series,
     periods_per_year: int,
     levels_bps: tuple[float, ...] = (0.0, 1.0, 2.0, 5.0, 10.0),
+    turnover: pd.Series | None = None,
 ) -> dict:
-    """Sharpe after a flat per-period drag, and the drag that kills the edge.
+    """Sharpe after trading friction, and the cost level that kills the edge.
 
-    A per-period cost is a crude stand-in for spread, slippage and commission,
-    but it answers the question that matters: how much friction does the claimed
-    edge survive?
+    With a turnover column the cost is charged where it is actually incurred:
+    ``net = gross - turnover * cost``. A strategy that trades 5% of the book a
+    day and one that trades it twice a day face wildly different bills for the
+    same spread, and a flat per-period charge cannot tell them apart.
+
+    Without turnover the cost is a flat drag on every period, which is a crude
+    proxy that silently assumes constant trading. The model actually used is
+    reported so the number is never read as more precise than it is.
     """
     mean = float(returns.mean())
-    breakeven_bps = float(mean * 10_000.0)
+
+    if turnover is not None and turnover.size:
+        aligned = pd.DataFrame(
+            {"r": returns, "turnover": turnover}
+        ).dropna()
+        rates = aligned["turnover"].clip(lower=0.0)
+        stream = aligned["r"]
+        mean_turnover = float(rates.mean())
+        breakeven = (
+            float(stream.mean() / mean_turnover * 10_000.0)
+            if mean_turnover > 0
+            else float("inf")
+        )
+        curve = {
+            float(bps): metrics.sharpe_ratio(
+                stream - rates * bps / 10_000.0, periods_per_year
+            )
+            for bps in levels_bps
+        }
+        return {
+            "model": "turnover",
+            "breakeven_bps": breakeven,
+            "curve": curve,
+            "gross_sharpe": curve.get(0.0, float("nan")),
+            "mean_turnover": mean_turnover,
+            "annual_turnover": float(mean_turnover * periods_per_year),
+            "n_priced": int(len(aligned)),
+        }
+
     curve = {
         float(bps): metrics.sharpe_ratio(
             returns - bps / 10_000.0, periods_per_year
@@ -434,9 +754,13 @@ def cost_sensitivity(
         for bps in levels_bps
     }
     return {
-        "breakeven_bps": breakeven_bps,
+        "model": "flat",
+        "breakeven_bps": float(mean * 10_000.0),
         "curve": curve,
         "gross_sharpe": curve.get(0.0, float("nan")),
+        "mean_turnover": float("nan"),
+        "annual_turnover": float("nan"),
+        "n_priced": int(returns.size),
     }
 
 
@@ -494,12 +818,16 @@ class Settings:
     confidence: float = 0.95
     n_boot: int = 2000
     cost_bps: float = 1.0
+    max_plausible_sharpe: float = 2.5   # set by the asset-class context
+    block: int | None = None            # bootstrap block length override
 
 
 def run_all(
     returns: pd.Series,
     periods_per_year: int,
     settings: Settings,
+    turnover: pd.Series | None = None,
+    benchmark_returns: pd.Series | None = None,
 ) -> dict:
     """Run every diagnostic once and hand back a single dictionary."""
     ppy = int(periods_per_year)
@@ -523,12 +851,32 @@ def run_all(
         sr_p, skew, kurt, benchmark_p, settings.confidence
     )
 
-    dispersion_ann, dispersion_source = trial_sharpe_dispersion(returns, ppy)
-    dsr, dsr_benchmark_p = deflated_sharpe_ratio(
-        sr_p, n, skew, kurt, settings.n_trials, dispersion_ann / np.sqrt(ppy)
+    dispersion_ann, dispersion_source, yearly_spread = (
+        trial_sharpe_dispersion(returns, ppy)
     )
+    dispersion_p = dispersion_ann / np.sqrt(ppy)
+    dsr, dsr_benchmark_p = deflated_sharpe_ratio(
+        sr_p, n, skew, kurt, settings.n_trials, dispersion_p
+    )
+    survives_to = breakeven_trials(
+        sr_p, n, skew, kurt, dispersion_p, settings.confidence
+    )
+    windows = window_sensitivity(returns, ppy)
 
     return {
+        "attribution": (
+            bm.regress(
+                returns, benchmark_returns, ppy, settings.rf_annual
+            )
+            if benchmark_returns is not None
+            else None
+        ),
+        "breakeven_trials": survives_to,
+        "dsr_curve": dsr_curve(sr_p, n, skew, kurt, dispersion_p),
+        "haircut": haircut_sharpe(sr_ann, n, ppy, settings.n_trials),
+        "windows": windows,
+        "window_summary": window_summary(windows, sr_ann),
+        "max_plausible_sharpe": float(settings.max_plausible_sharpe),
         "n": n,
         "periods_per_year": ppy,
         "skew": skew,
@@ -558,9 +906,12 @@ def run_all(
         "dsr_benchmark_annual": float(dsr_benchmark_p * np.sqrt(ppy)),
         "trial_dispersion_annual": dispersion_ann,
         "trial_dispersion_source": dispersion_source,
+        "trial_dispersion_yearly": yearly_spread,
         "n_trials": int(settings.n_trials),
         "smoothing": smoothing_profile(returns, ppy),
-        "bootstrap": bootstrap_sharpe(returns, ppy, settings.n_boot),
+        "bootstrap": bootstrap_sharpe(
+            returns, ppy, settings.n_boot, settings.block
+        ),
         "permutation_dd": permutation_drawdown(returns),
         "concentration": concentration(returns),
         "sharpe_without_best5": sharpe_without_best(returns, ppy, 5),
@@ -570,6 +921,7 @@ def run_all(
             tuple(sorted(
                 {0.0, 1.0, 2.0, 5.0, 10.0, float(settings.cost_bps)}
             )),
+            turnover=turnover,
         ),
         "stability": stability(returns, ppy),
     }

@@ -135,6 +135,109 @@ parameter you swept, defeats the entire correction.
     )
 
 with st.expander(
+    "How much search a result survives", icon=":material/search_insights:"
+):
+    st.markdown(
+        r"""
+The deflated Sharpe ratio needs a trial count, and asking a researcher for one
+invites the flattering answer. Since $\mathrm{DSR}$ falls monotonically as $N$
+rises, the question can be inverted: there is a unique $N^{*}$ at which it
+crosses the confidence threshold.
+
+Reporting $N^{*}$ instead of demanding $N$ changes the incentive. Nobody has to
+grade their own search; they only have to judge whether it was wider than the
+number on screen, which is a question they can answer honestly.
+
+**How to read it.** "Survives up to 40 trials" means that if you fitted more
+than about forty variants on this data, the result is no longer distinguishable
+from the best of that many random attempts.
+"""
+    )
+
+with st.expander(
+    "Multiple-testing haircut", icon=":material/content_cut:"
+):
+    st.markdown(
+        r"""
+Harvey and Liu (2015) run the same correction through the p-value rather than
+the Sharpe. The observed Sharpe implies a t-statistic, that implies a p-value,
+the p-value is adjusted for having been the best of $N$ attempts, and the
+adjusted p-value is turned back into a Sharpe:
+
+$$
+t = \hat{SR}\sqrt{T}, \qquad
+p_{\text{adj}} = \min(1,\, p N), \qquad
+SR_{\text{haircut}} = \frac{t(p_{\text{adj}})}{\sqrt{T}}
+$$
+
+A Bonferroni adjustment is used, the most conservative of the three Harvey and
+Liu describe: it assumes the trials were independent, and correlated trials
+would be penalised less.
+
+**How to read it.** This is an adjustment for selection, **not** a forecast. It
+says what the evidence is worth after admitting how hard you looked, not what
+the strategy will earn next year.
+"""
+    )
+
+with st.expander("Alpha versus beta", icon=":material/call_split:"):
+    st.markdown(
+        r"""
+Every other test on this page looks at the return series in isolation, and none
+of them can tell an edge from leverage. A strategy that is 0.8 beta to the
+equity market passes all of them, because holding the market really does
+produce a positive Sharpe — just not one anybody should pay you for.
+
+Given a benchmark, QuantProof runs
+
+$$
+r_t - r_f = \alpha + \beta\,(b_t - r_f) + \varepsilon_t
+$$
+
+with Newey-West standard errors at $\lfloor 4(T/100)^{2/9} \rfloor$ lags, so
+autocorrelation cannot overstate the significance of $\alpha$. It then reports
+the **hedged** stream $r_t - \beta b_t$ and its Sharpe, which is what a desk
+would actually hold after shorting the benchmark against the position.
+
+**How to read it.** The hedged Sharpe is the number worth paying for. If it is
+near zero, the benchmark was the strategy.
+"""
+    )
+
+with st.expander("Sample window sensitivity", icon=":material/crop_free:"):
+    st.markdown(
+        """
+The Sharpe ratio is recomputed over every start and end date on a grid, using
+prefix sums so each window costs almost nothing. The result is a heatmap of how
+the headline number varies with the sample chosen.
+
+**How to read it.** A real edge shows up over most windows. A result that lives
+in one corner of the grid is a statement about that window, not about the
+strategy. This is the only test here that catches a date range picked with
+hindsight: the reshuffle test varies the *order* of returns inside a fixed
+window, which is a different question.
+"""
+    )
+
+with st.expander("Trading costs", icon=":material/receipt_long:"):
+    st.markdown(
+        """
+With a turnover column, cost is charged where it is incurred:
+`net = gross - turnover x cost`. A strategy that trades 5% of the book a day
+and one that trades it twice a day face very different bills for the same
+spread, and a flat per-period charge cannot tell them apart.
+
+Without turnover, the cost is a flat drag on every period — the round-trip cost
+multiplied by an assumed turnover taken from the asset-class setting. That is a
+proxy, and it is labelled as one wherever it appears.
+
+**How to read it.** The breakeven cost is the entire budget available for
+spread, slippage, commission, borrow and market impact. Most backtests are
+gross of all of it.
+"""
+    )
+
+with st.expander(
     "Serial correlation and smoothing", icon=":material/waves:"
 ):
     st.markdown(
@@ -237,6 +340,18 @@ st.markdown(
     "of failures and how badly each one failed."
 )
 
+st.warning(
+    "**The weights below are a judgement call, not an estimate.** They were "
+    "chosen by hand and calibrated against nothing. The checks are also not "
+    "independent: the probabilistic Sharpe, minimum track record length and "
+    "deflated Sharpe are largely the same evidence counted three times, which "
+    "quietly gives statistical significance more say than fragility. And any "
+    "single number invites people to optimise against it, which is the exact "
+    "pathology this app exists to detect. Read the individual checks; treat "
+    "the score as a summary for people who will not.",
+    icon=":material/warning:",
+)
+
 catalog = check_catalog()
 st.dataframe(
     catalog,
@@ -304,6 +419,8 @@ st.markdown(
   Financial Economics 74(3).
 - Harvey, C. and Liu, Y. (2015). *Backtesting.* Journal of Portfolio
   Management 42(1).
+- Newey, W. and West, K. (1994). *Automatic Lag Selection in Covariance
+  Matrix Estimation.* Review of Economic Studies 61(4).
 - Politis, D. and Romano, J. (1994). *The Stationary Bootstrap.* Journal of
   the American Statistical Association 89(428).
 """

@@ -12,7 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from qp import (  # noqa: E402
-    checks, diagnostics, loading, metrics, samples, scoring,
+    benchmark, checks, context, diagnostics, loading, metrics, samples,
+    scoring,
 )
 
 
@@ -228,8 +229,9 @@ def test_lo_factor_penalises_positive_autocorrelation():
     series = pd.Series(
         smoothed, index=pd.bdate_range("2019-01-01", periods=len(smoothed))
     )
-    factor = diagnostics.lo_annualisation_factor(series, 252)
+    factor, lags = diagnostics.lo_annualisation_factor(series, 252)
     assert factor < np.sqrt(252)
+    assert lags >= 1
 
 
 def test_bootstrap_brackets_the_observed_sharpe():
@@ -265,6 +267,8 @@ def evaluate(frame, value_col, date_col="date", **settings):
     loaded = loading.build_series(
         frame, value_col=value_col, date_col=date_col
     )
+    settings.setdefault("max_plausible_sharpe", 2.5)
+    settings.setdefault("cost_bps", 0.5)
     cfg = diagnostics.Settings(**settings)
     perf = metrics.compute_performance(
         loaded.returns, loaded.periods_per_year, cfg.rf_annual
@@ -377,7 +381,7 @@ def test_app_starts_and_analyses_a_sample():
 
     scores = [m.value for m in app.metric if m.label == "Trust score"]
     assert scores and scores[0].endswith("/ 100")
-    assert len(app.tabs) == 5
+    assert len(app.tabs) == 6
 
 
 def test_app_reports_a_file_that_is_too_short():
@@ -402,3 +406,289 @@ def test_methodology_page_renders():
     app.run()
     assert not app.exception
     assert app.title[0].value == "Methodology"
+
+
+# ---------------------------------------------------------------------------
+# Breakeven trials and the haircut
+# ---------------------------------------------------------------------------
+
+def test_breakeven_trials_falls_as_the_edge_weakens():
+    strong = diagnostics.breakeven_trials(0.09, 2000, 0.0, 3.0, 0.01)
+    weak = diagnostics.breakeven_trials(0.03, 2000, 0.0, 3.0, 0.01)
+    assert strong > weak
+
+
+def test_breakeven_trials_is_zero_without_significance():
+    assert diagnostics.breakeven_trials(0.001, 60, 0.0, 3.0, 0.05) == 0
+
+
+def test_dsr_at_breakeven_sits_on_the_threshold():
+    args = (0.08, 1500, 0.0, 3.0, 0.02)
+    n_star = diagnostics.breakeven_trials(*args, threshold=0.95)
+    assert n_star > 0
+    at, _ = diagnostics.deflated_sharpe_ratio(*args[:4], n_star, args[4])
+    beyond, _ = diagnostics.deflated_sharpe_ratio(
+        *args[:4], n_star + 1, args[4]
+    )
+    assert at >= 0.95 > beyond
+
+
+def test_dsr_curve_is_monotonically_decreasing():
+    curve = diagnostics.dsr_curve(0.08, 1500, 0.0, 3.0, 0.02)
+    assert curve["trials"].is_monotonic_increasing
+    assert np.all(np.diff(curve["dsr"].to_numpy()) <= 1e-9)
+
+
+def test_haircut_shrinks_with_more_trials():
+    once = diagnostics.haircut_sharpe(1.5, 1000, 252, 1)
+    many = diagnostics.haircut_sharpe(1.5, 1000, 252, 500)
+    assert once["haircut_sharpe"] == pytest.approx(1.5, rel=0.15)
+    assert many["haircut_sharpe"] < once["haircut_sharpe"]
+    assert 0.0 <= many["haircut"] <= 1.0
+
+
+def test_haircut_never_exceeds_the_reported_sharpe():
+    result = diagnostics.haircut_sharpe(2.0, 800, 252, 50)
+    assert result["haircut_sharpe"] <= 2.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Window sensitivity
+# ---------------------------------------------------------------------------
+
+def test_window_sensitivity_covers_many_windows():
+    frame = make_frame(n=1200, seed=21)
+    loaded = loading.build_series(frame, value_col="return", date_col="date")
+    grid = diagnostics.window_sensitivity(loaded.returns, 252)
+    assert len(grid) > 50
+    assert (grid["end"] > grid["start"]).all()
+    assert grid["n"].min() >= 20
+
+
+def test_window_sensitivity_flags_a_regime_change():
+    """A strategy that dies halfway should look worse from a later start.
+
+    ``share_above_half`` is measured against each series' own headline Sharpe,
+    so it is not comparable between two different strategies. The property
+    worth asserting is directional: windows that begin after the edge has gone
+    should score materially lower than windows that begin before it.
+    """
+    rng = np.random.default_rng(31)
+    values = np.concatenate(
+        [rng.normal(0.0012, 0.008, 700), rng.normal(0.0, 0.008, 700)]
+    )
+    series = pd.Series(
+        values, index=pd.bdate_range("2015-01-01", periods=values.size)
+    )
+
+    grid = diagnostics.window_sensitivity(series, 252)
+    cutoff = grid["start_i"].median()
+    early = grid[grid["start_i"] <= cutoff]["sharpe"].median()
+    late = grid[grid["start_i"] > cutoff]["sharpe"].median()
+    assert late < early - 0.5
+
+
+# ---------------------------------------------------------------------------
+# Benchmark attribution
+# ---------------------------------------------------------------------------
+
+def make_pair(beta=0.8, alpha_daily=0.0, n=1500, seed=41):
+    rng = np.random.default_rng(seed)
+    index = pd.bdate_range("2017-01-02", periods=n)
+    market = pd.Series(rng.normal(0.0004, 0.010, n), index=index)
+    noise = rng.normal(alpha_daily, 0.004, n)
+    strategy = pd.Series(beta * market.to_numpy() + noise, index=index)
+    return strategy, market
+
+
+def test_regression_recovers_a_known_beta():
+    strategy, market = make_pair(beta=0.75)
+    result = benchmark.regress(strategy, market, 252)
+    assert result is not None
+    assert result.beta == pytest.approx(0.75, abs=0.05)
+    assert result.r_squared > 0.5
+
+
+def test_pure_beta_leaves_no_alpha():
+    strategy, market = make_pair(beta=0.9, alpha_daily=0.0)
+    result = benchmark.regress(strategy, market, 252)
+    assert abs(result.alpha_t) < 2.5
+
+
+def test_real_alpha_is_detected():
+    strategy, market = make_pair(beta=0.3, alpha_daily=0.0005)
+    result = benchmark.regress(strategy, market, 252)
+    assert result.alpha_t > 2.5
+    assert result.alpha_annual > 0
+
+
+def test_hedging_removes_the_benchmark():
+    strategy, market = make_pair(beta=0.9, alpha_daily=0.0)
+    result = benchmark.regress(strategy, market, 252)
+    residual = benchmark.regress(result.hedged, market, 252)
+    assert abs(residual.beta) < 0.05
+
+
+def test_regression_needs_overlap():
+    strategy, market = make_pair(n=1500)
+    assert benchmark.regress(strategy.iloc[:5], market, 252) is None
+
+
+def test_newey_west_bandwidth_grows_with_sample():
+    small = benchmark.newey_west_bandwidth(100)
+    large = benchmark.newey_west_bandwidth(100_000)
+    assert small < large
+
+
+def test_alpha_check_skips_without_a_benchmark():
+    results, _ = evaluate_sample(samples.trend_follower())
+    alpha = next(c for c in results if c.key == "alpha")
+    assert alpha.status == checks.SKIP
+
+
+def test_alpha_check_fails_on_pure_beta():
+    strategy, market = make_pair(beta=0.9, alpha_daily=0.0, n=2000)
+    frame = pd.DataFrame(
+        {
+            "date": strategy.index,
+            "strategy_return": strategy.to_numpy(),
+            "benchmark": market.to_numpy(),
+        }
+    )
+    loaded = loading.build_series(
+        frame, value_col="strategy_return", date_col="date"
+    )
+    cfg = diagnostics.Settings()
+    perf = metrics.compute_performance(loaded.returns, 252)
+    diag = diagnostics.run_all(
+        loaded.returns, 252, cfg, benchmark_returns=market
+    )
+    alpha = next(
+        c for c in checks.run_checks(perf, diag, loaded, cfg)
+        if c.key == "alpha"
+    )
+    assert alpha.status == checks.FAIL
+
+
+# ---------------------------------------------------------------------------
+# Turnover and asset-class context
+# ---------------------------------------------------------------------------
+
+def test_turnover_column_is_detected_and_used():
+    frame = make_frame(n=500, seed=51)
+    frame["turnover"] = 0.4
+    loaded = loading.build_series(
+        frame, value_col="return", date_col="date", turnover_col="turnover"
+    )
+    assert loaded.turnover is not None
+
+    priced = diagnostics.cost_sensitivity(
+        loaded.returns, 252, (0.0, 10.0), turnover=loaded.turnover
+    )
+    flat = diagnostics.cost_sensitivity(loaded.returns, 252, (0.0, 10.0))
+    assert priced["model"] == "turnover"
+    assert priced["mean_turnover"] == pytest.approx(0.4)
+    # 10 bps against 40% turnover costs 4 bps a period, not the full 10.
+    assert priced["curve"][10.0] > flat["curve"][10.0]
+
+
+def test_turnover_is_guessed_from_the_column_name():
+    frame = make_frame(n=200)
+    frame["turnover"] = 0.25
+    guessed = loading.guess_turnover_column(frame, ("date", "return"))
+    assert guessed == "turnover"
+
+
+def test_zero_turnover_periods_pay_nothing():
+    frame = make_frame(n=400, seed=52)
+    frame["turnover"] = 0.0
+    loaded = loading.build_series(
+        frame, value_col="return", date_col="date", turnover_col="turnover"
+    )
+    costs = diagnostics.cost_sensitivity(
+        loaded.returns, 252, (0.0, 50.0), turnover=loaded.turnover
+    )
+    assert costs["curve"][50.0] == pytest.approx(costs["curve"][0.0])
+
+
+def test_context_raises_the_ceiling_for_fast_books():
+    assert (
+        context.get("hft").max_plausible_sharpe
+        > context.get("equity_daily").max_plausible_sharpe
+    )
+
+
+def test_context_cost_is_turnover_times_spread():
+    equity = context.get("equity_daily")
+    expected = equity.round_trip_bps * equity.assumed_turnover
+    assert equity.flat_cost_bps == pytest.approx(expected)
+
+
+def test_a_fast_book_is_not_failed_for_being_fast():
+    """Sharpe 6 is a red flag in daily equity and ordinary in market making."""
+    rng = np.random.default_rng(61)
+    n = 2000
+    values = rng.normal(0.0, 0.001, n)
+    values = values - values.mean()
+    values = values + 6.0 * values.std(ddof=1) / np.sqrt(252)
+    frame = pd.DataFrame(
+        {"date": pd.bdate_range("2018-01-01", periods=n), "return": values}
+    )
+
+    as_equity, _ = evaluate(frame, "return", max_plausible_sharpe=2.5)
+    as_hft, _ = evaluate(frame, "return", max_plausible_sharpe=10.0)
+
+    equity_status = next(
+        c.status for c in as_equity if c.key == "sharpe_prior"
+    )
+    hft_status = next(c.status for c in as_hft if c.key == "sharpe_prior")
+    assert equity_status == checks.FAIL
+    assert hft_status == checks.PASS
+
+
+# ---------------------------------------------------------------------------
+# Tearsheet helpers
+# ---------------------------------------------------------------------------
+
+def test_drawdown_table_finds_the_worst_episode():
+    returns = pd.Series(
+        [0.1, -0.3, 0.05, 0.4, -0.1, 0.2],
+        index=pd.bdate_range("2022-01-03", periods=6),
+    )
+    table = metrics.drawdown_table(returns, 5)
+    assert not table.empty
+    assert table["depth"].iloc[0] == pytest.approx(
+        metrics.max_drawdown(returns)
+    )
+    assert (table["trough"] >= table["peak"]).all()
+
+
+def test_monthly_grid_has_one_row_per_month():
+    frame = make_frame(n=500, seed=71)
+    loaded = loading.build_series(frame, value_col="return", date_col="date")
+    grid = metrics.monthly_return_grid(loaded.returns)
+    assert set(grid.columns) == {"year", "month", "return"}
+    assert len(grid) == len(grid[["year", "month"]].drop_duplicates())
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap corrections
+# ---------------------------------------------------------------------------
+
+def test_block_length_grows_with_dependence():
+    rng = np.random.default_rng(81)
+    independent = pd.Series(rng.normal(0, 0.01, 1200))
+    raw = rng.normal(0, 0.01, 1210)
+    smoothed = pd.Series(np.convolve(raw, [0.5, 0.3, 0.2], mode="valid"))
+    assert (
+        diagnostics.dependence_block_length(smoothed)
+        > diagnostics.dependence_block_length(independent)
+    )
+
+
+def test_bootstrap_reports_its_bias_correction():
+    frame = make_frame(n=800, seed=82)
+    loaded = loading.build_series(frame, value_col="return", date_col="date")
+    result = diagnostics.bootstrap_sharpe(loaded.returns, 252, n_boot=800)
+    assert np.isfinite(result["bias_z0"])
+    assert 0.0 < result["lo_pct"] < result["hi_pct"] < 100.0

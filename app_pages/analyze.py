@@ -5,15 +5,8 @@ import pandas as pd
 import streamlit as st
 
 import ui
-from qp import checks, loading, metrics, samples
+from qp import checks, context, loading, metrics, samples
 
-DEFAULT_COST_BPS = {
-    "Daily": 1.0,
-    "Weekly": 5.0,
-    "Monthly": 10.0,
-    "Quarterly": 20.0,
-    "Annual": 30.0,
-}
 KIND_LABELS = {
     "auto": "Detect automatically",
     "returns": "Period returns",
@@ -29,20 +22,15 @@ SCALE_LABELS = {
 def load_source(frame, label, note=None, trials=1):
     """Adopt a new table and forget how the last one was interpreted.
 
-    The assumption defaults are set here, before the sidebar widgets are
-    created, so a monthly file is costed per month from its very first render
-    and a trial count carried over from an example never taints an upload.
+    Defaults are set here, before the sidebar widgets are created, so a
+    trial count carried over from an example never taints a later upload.
     """
     st.session_state.frame = frame
     st.session_state.source_label = label
     st.session_state.source_note = note
     st.session_state.overrides = {}
     st.session_state.trials_default = trials
-    st.session_state.cost_default = (
-        DEFAULT_COST_BPS[loading.peek_frequency(frame)]
-        if frame is not None
-        else 1.0
-    )
+    st.session_state.benchmark_frame = None
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +58,21 @@ with st.sidebar:
                 st.session_state.last_upload = upload_id
                 st.error(str(exc), icon=":material/error:")
 
+    st.markdown("**Context**")
+    context_key = st.selectbox(
+        "Asset class and horizon",
+        options=[c.key for c in context.CONTEXTS],
+        format_func=lambda k: context.get(k).label,
+        help=(
+            "Sets the ceiling above which a Sharpe ratio is treated as "
+            "implausible, and the default cost assumption. A market-making "
+            "book legitimately runs a Sharpe that would be a red flag in a "
+            "daily equity backtest."
+        ),
+    )
+    active = context.get(context_key)
+    st.caption(active.note)
+
     st.markdown("**Assumptions**")
     n_trials = st.number_input(
         "Strategy variants you tested",
@@ -93,13 +96,41 @@ with st.sidebar:
         help="Set this above zero to test against a benchmark rather than "
              "against doing nothing.",
     )
-    cost_bps = st.number_input(
-        "Assumed cost per period (bps)",
-        min_value=0.0, max_value=250.0,
-        value=float(st.session_state.get("cost_default", 1.0)), step=0.5,
-        help="Round-trip friction charged to every period: spread, slippage, "
-             "commission and impact.",
+    round_trip_bps = st.number_input(
+        "Round-trip cost (bps of turnover)",
+        min_value=0.0, max_value=500.0,
+        value=float(active.round_trip_bps), step=0.5,
+        help="Spread, slippage, commission and impact for trading the whole "
+             "book once.",
     )
+    assumed_turnover = st.number_input(
+        "Turnover per period",
+        min_value=0.0, max_value=50.0,
+        value=float(active.assumed_turnover), step=0.05,
+        help="Fraction of the book traded each period; 0.10 means 10%. "
+             "Ignored when the file carries a turnover column.",
+    )
+    st.markdown("**Benchmark**")
+    st.caption(
+        "Without one, nothing here can tell an edge from leverage."
+    )
+    benchmark_file = st.file_uploader(
+        "Benchmark returns",
+        type=["csv", "txt", "tsv", "xlsx", "xls"],
+        help=(
+            "Optional second file with the benchmark's returns. If your main "
+            "file already has a benchmark column, pick it on the Data tab "
+            "instead."
+        ),
+    )
+    if benchmark_file is not None:
+        try:
+            st.session_state.benchmark_frame = loading.read_table(
+                benchmark_file.getvalue(), benchmark_file.name
+            )
+        except loading.LoadError as exc:
+            st.error(str(exc), icon=":material/error:")
+
     with st.expander("Advanced", icon=":material/tune:"):
         confidence = st.select_slider(
             "Confidence level", options=[0.90, 0.95, 0.99], value=0.95,
@@ -200,6 +231,10 @@ try:
         kind=overrides.get("kind", "auto"),
         scale=overrides.get("scale", "auto"),
         frequency=overrides.get("frequency", "auto"),
+        turnover_col=overrides.get(
+            "turnover_col",
+            loading.guess_turnover_column(frame, (date_col, value_col)),
+        ),
     )
 except loading.LoadError as exc:
     st.error(str(exc), icon=":material/error:")
@@ -213,14 +248,49 @@ if loaded.n < 20:
     )
     st.stop()
 
+# A benchmark can come from a column of the same file or a second upload.
+benchmark_col = overrides.get("benchmark_col")
+benchmark_returns = None
+benchmark_label = None
+
+if benchmark_col and benchmark_col in frame.columns:
+    try:
+        benchmark_returns = loading.build_series(
+            frame, value_col=benchmark_col, date_col=date_col
+        ).returns
+        benchmark_label = f"{benchmark_col} (same file)"
+    except loading.LoadError:
+        benchmark_returns = None
+elif st.session_state.get("benchmark_frame") is not None:
+    bench_frame = st.session_state.benchmark_frame
+    bench_date = loading.guess_date_column(bench_frame)
+    bench_value = loading.guess_value_column(bench_frame, bench_date)
+    if bench_value is not None:
+        try:
+            benchmark_returns = loading.build_series(
+                bench_frame, value_col=bench_value, date_col=bench_date
+            ).returns
+            benchmark_label = f"{bench_value} (uploaded file)"
+        except loading.LoadError:
+            benchmark_returns = None
+
+# With a turnover column the round-trip figure is charged against the actual
+# turnover; without one it has to be multiplied by an assumed rate first.
+if loaded.turnover is not None:
+    effective_cost_bps = float(round_trip_bps)
+else:
+    effective_cost_bps = float(round_trip_bps * assumed_turnover)
+
 perf, diag, cfg, results, verdict = ui.evaluate(
     loaded,
+    benchmark_returns=benchmark_returns,
     rf_annual=rf_pct / 100.0,
     n_trials=int(n_trials),
     benchmark_sharpe=float(hurdle),
-    cost_bps=float(cost_bps),
+    cost_bps=effective_cost_bps,
     confidence=float(confidence),
     n_boot=int(n_boot),
+    max_plausible_sharpe=float(active.max_plausible_sharpe),
 )
 
 st.caption(
@@ -240,6 +310,19 @@ with st.container(border=True):
     score_col, story_col = st.columns([1, 2.6], gap="large")
 
     with score_col:
+        haircut = diag["haircut"]["haircut_sharpe"]
+        st.metric(
+            "Sharpe after the multiple-testing haircut",
+            ui.num(haircut),
+            delta=f"from {ui.num(perf.sharpe)} reported",
+            delta_color="off",
+            help=(
+                "Harvey and Liu's haircut: the Sharpe that carries the same "
+                "evidential weight once the search behind it is admitted. It "
+                "is an adjustment for selection, not a forecast of future "
+                "performance."
+            ),
+        )
         st.metric("Trust score", f"{verdict.score_int} / 100")
         st.progress(verdict.score / 100.0)
         st.badge(
@@ -290,6 +373,13 @@ with st.container(horizontal=True):
         border=True,
         help="Probability the true Sharpe beats the hurdle, given skew, fat "
              "tails and sample size.",
+    )
+    st.metric(
+        "Survives up to",
+        f"{diag['breakeven_trials']:,} trials",
+        border=True,
+        help="The trial count at which this Sharpe stops being "
+             "distinguishable from the best of that many random attempts.",
     )
     st.metric(
         "Deflated Sharpe",
@@ -363,8 +453,15 @@ for category in checks.CATEGORIES:
 
 st.subheader("Evidence", icon=":material/insights:")
 
-track, significance, path, costs, data = st.tabs(
-    ["Track record", "Is it real?", "Path and smoothing", "Costs", "Data"]
+track, significance, alpha_tab, path, costs, data = st.tabs(
+    [
+        "Track record",
+        "Is it real?",
+        "Alpha or beta?",
+        "Path and smoothing",
+        "Costs",
+        "Data",
+    ]
 )
 
 with track:
@@ -378,6 +475,48 @@ with track:
     if yearly.size >= 2:
         st.markdown("**Calendar-year returns**")
         st.altair_chart(ui.yearly_chart(yearly))
+
+    grid = metrics.monthly_return_grid(loaded.returns)
+    if grid["year"].nunique() >= 2 and loaded.periods_per_year >= 12:
+        st.markdown("**Returns by month**")
+        st.altair_chart(ui.monthly_heatmap(grid))
+
+    worst = metrics.drawdown_table(loaded.returns, 5)
+    if not worst.empty:
+        st.markdown("**The five worst drawdowns**")
+        display_dd = worst.copy()
+        display_dd["recovery_days"] = display_dd["recovery_days"].replace(
+            -1, None
+        )
+        st.dataframe(
+            display_dd,
+            hide_index=True,
+            column_config={
+                "depth": st.column_config.NumberColumn(
+                    "Depth", format="percent"
+                ),
+                "peak": st.column_config.DateColumn(
+                    "Peak", format="YYYY-MM-DD"
+                ),
+                "trough": st.column_config.DateColumn(
+                    "Trough", format="YYYY-MM-DD"
+                ),
+                "recovered": st.column_config.DateColumn(
+                    "Recovered", format="YYYY-MM-DD"
+                ),
+                "length_days": st.column_config.NumberColumn(
+                    "Peak to recovery (days)", format="%d"
+                ),
+                "recovery_days": st.column_config.NumberColumn(
+                    "Trough to recovery (days)", format="%d"
+                ),
+            },
+        )
+        st.caption(
+            "A blank recovery date means the strategy never regained that "
+            "peak inside the sample. The single max-drawdown number cannot "
+            "tell you whether a loss was one bad week or a three-year grind."
+        )
 
     with st.container(horizontal=True):
         st.metric("Sortino", ui.num(perf.sortino), border=True)
@@ -459,6 +598,111 @@ with significance:
             f"{ui.num(diag['trial_dispersion_annual'])}, estimated from the "
             f"{diag['trial_dispersion_source']}."
         )
+
+    st.markdown("**How much search this result would survive**")
+    st.altair_chart(
+        ui.dsr_curve_chart(
+            diag["dsr_curve"],
+            int(n_trials),
+            diag["breakeven_trials"],
+            float(confidence),
+        )
+    )
+    st.caption(
+        "The deflated Sharpe falls as the search behind a result widens. The "
+        "green line is where it crosses "
+        f"{confidence:.0%} — {diag['breakeven_trials']:,} trials. The orange "
+        "line is what you reported. Asking where the curve crosses is a "
+        "fairer question than asking you to grade your own search."
+    )
+
+    st.markdown("**Does the result depend on the sample window?**")
+    windows = diag["windows"]
+    if not windows.empty:
+        st.altair_chart(ui.window_heatmap(windows))
+        summary = diag["window_summary"]
+        st.caption(
+            f"Sharpe recomputed over {summary['n_windows']:,} start and end "
+            f"date pairs, from {ui.num(summary['worst'])} to "
+            f"{ui.num(summary['best'])} with a median of "
+            f"{ui.num(summary['median'])}. Blue is positive, red is negative. "
+            "A result that survives only in the top-left corner is a "
+            "statement about one window, not about the strategy."
+        )
+    else:
+        st.caption("Too few observations to vary the window.")
+
+
+with alpha_tab:
+    attribution = diag.get("attribution")
+    if attribution is None:
+        st.info(
+            "No benchmark supplied, so this page cannot separate an edge from "
+            "leverage. Upload a benchmark in the sidebar, or pick a benchmark "
+            "column on the Data tab.",
+            icon=":material/info:",
+        )
+        st.markdown(
+            "Every other test here looks at the return series in isolation. "
+            "A strategy that is 0.8 beta to the equity market will pass all "
+            "of them, because holding the market really does produce a "
+            "positive Sharpe with a real edge behind it — someone else's. "
+            "This is the single largest blind spot in the analysis."
+        )
+    else:
+        with st.container(horizontal=True):
+            st.metric(
+                "Alpha a year",
+                ui.pct(attribution.alpha_annual),
+                border=True,
+            )
+            st.metric(
+                "t-statistic",
+                ui.num(attribution.alpha_t),
+                border=True,
+                help=f"Newey-West, {attribution.nw_lags} lags.",
+            )
+            st.metric("Beta", ui.num(attribution.beta), border=True)
+            st.metric(
+                "R squared", ui.pct(attribution.r_squared, 0), border=True
+            )
+            st.metric(
+                "Correlation", ui.num(attribution.correlation), border=True
+            )
+
+        with st.container(horizontal=True):
+            st.metric(
+                "Strategy Sharpe",
+                ui.num(attribution.strategy_sharpe),
+                border=True,
+            )
+            st.metric(
+                "Benchmark Sharpe",
+                ui.num(attribution.benchmark_sharpe),
+                border=True,
+            )
+            st.metric(
+                "Hedged Sharpe",
+                ui.num(attribution.hedged_sharpe),
+                border=True,
+                help="What is left after shorting the benchmark against the "
+                     "position. This is the number worth paying for.",
+            )
+
+        st.caption(
+            f"Benchmark: {benchmark_label}. Overlapping observations: "
+            f"{attribution.n:,}. Standard errors are Newey-West with "
+            f"{attribution.nw_lags} lags, which stops autocorrelation from "
+            "overstating the significance of the alpha."
+        )
+
+        st.markdown("**The hedged return stream**")
+        st.altair_chart(ui.equity_chart(attribution.hedged))
+        st.caption(
+            "Growth of one unit in the strategy after the benchmark has been "
+            "hedged out. If this line is flat, the strategy was the benchmark."
+        )
+
 
 with path:
     left, right = st.columns(2, gap="large")
@@ -591,6 +835,37 @@ with data:
             ),
         )
 
+        others = ["(none)"] + [c for c in numeric if c != value_col]
+        row_extra = st.columns(2)
+        new_benchmark = row_extra[0].selectbox(
+            "Benchmark column",
+            options=others,
+            index=(
+                others.index(benchmark_col)
+                if benchmark_col in others
+                else 0
+            ),
+            help="Separates alpha from beta. Leave as none to use the "
+                 "benchmark file uploaded in the sidebar, if any.",
+        )
+        turnover_options = ["(none)"] + [
+            c for c in numeric if c != value_col
+        ]
+        current_turnover = overrides.get(
+            "turnover_col", loaded.turnover_column
+        )
+        new_turnover = row_extra[1].selectbox(
+            "Turnover column",
+            options=turnover_options,
+            index=(
+                turnover_options.index(current_turnover)
+                if current_turnover in turnover_options
+                else 0
+            ),
+            help="A traded fraction per period, so 0.40 means 40% of the "
+                 "book. Charges costs where they are actually incurred.",
+        )
+
         row_two = st.columns(2)
         new_kind = row_two[0].selectbox(
             "The column contains",
@@ -612,6 +887,12 @@ with data:
                 "kind": new_kind,
                 "scale": new_scale,
                 "frequency": new_freq,
+                "benchmark_col": (
+                    None if new_benchmark == "(none)" else new_benchmark
+                ),
+                "turnover_col": (
+                    None if new_turnover == "(none)" else new_turnover
+                ),
             }
             st.rerun()
 

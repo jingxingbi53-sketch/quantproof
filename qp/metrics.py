@@ -220,6 +220,75 @@ def rolling_sharpe(
     return out
 
 
+def drawdown_table(returns: pd.Series, top: int = 5) -> pd.DataFrame:
+    """The worst drawdowns with their peak, trough and recovery dates.
+
+    A single maximum-drawdown number hides the thing that actually decides
+    whether a strategy survives contact with an investor: whether the loss was
+    one bad week or a three-year grind back to the previous high.
+    """
+    if returns.empty:
+        return pd.DataFrame()
+
+    dd = drawdown_series(returns)
+    underwater = (dd < -1e-12).to_numpy()
+    index = pd.DatetimeIndex(dd.index)
+
+    episodes = []
+    start = None
+    for position, is_under in enumerate(underwater):
+        if is_under and start is None:
+            start = position
+        elif not is_under and start is not None:
+            episodes.append((start, position - 1, True))
+            start = None
+    if start is not None:
+        episodes.append((start, len(underwater) - 1, False))
+
+    rows = []
+    for begin, end, recovered in episodes:
+        window = dd.iloc[begin:end + 1]
+        trough = int(window.to_numpy().argmin())
+        peak_date = index[begin - 1] if begin > 0 else index[begin]
+        rows.append(
+            {
+                "depth": float(window.iloc[trough]),
+                "peak": peak_date,
+                "trough": index[begin + trough],
+                "recovered": index[end] if recovered else pd.NaT,
+                "length_days": int((index[end] - peak_date).days),
+                "recovery_days": (
+                    int((index[end] - index[begin + trough]).days)
+                    if recovered
+                    else -1
+                ),
+            }
+        )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    return frame.nsmallest(top, "depth").reset_index(drop=True)
+
+
+def monthly_return_grid(returns: pd.Series) -> pd.DataFrame:
+    """Returns compounded into a year-by-month grid, the classic tearsheet."""
+    if returns.empty:
+        return pd.DataFrame()
+    index = pd.DatetimeIndex(returns.index)
+    # Name the groupers explicitly: an unnamed grouper inherits the index's
+    # own name and then collides with it on reset_index.
+    years = pd.Index(index.year, name="year")
+    months = pd.Index(index.month, name="month")
+    growth = pd.Series(
+        (1.0 + returns).to_numpy(dtype=float),
+        index=pd.MultiIndex.from_arrays([years, months]),
+    )
+    monthly = growth.groupby(level=["year", "month"]).prod() - 1.0
+    monthly.name = "return"
+    return monthly.reset_index()
+
+
 def calendar_year_returns(returns: pd.Series) -> pd.Series:
     """Compounded return for each calendar year in the sample."""
     if returns.empty:
