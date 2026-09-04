@@ -1,0 +1,84 @@
+# QuantProof theme. Both light and dark variants are defined, so the appearance
+# menu lets a viewer switch and every colour below is chosen against its own
+# background rather than flipped automatically.
+
+[theme]
+font = "'Inter', 'Segoe UI', system-ui, sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Inter', 'Segoe UI', system-ui, sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono', ui-monospace, monospace:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 15
+headingFontSizes = ["30px", "23px", "18px", "16px", "14px", "13px"]
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+baseRadius = "6px"
+buttonRadius = "6px"
+linkUnderline = false
+showWidgetBorder = true
+showSidebarBorder = true
+
+[theme.light]
+primaryColor = "#1859C4"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F6FA"
+codeBackgroundColor = "#F3F6FA"
+textColor = "#101828"
+linkColor = "#1859C4"
+borderColor = "#E1E7EF"
+dataframeBorderColor = "#E1E7EF"
+dataframeHeaderBackgroundColor = "#F3F6FA"
+greenColor = "#067647"
+redColor = "#BC3B32"
+yellowColor = "#A15C07"
+orangeColor = "#B54708"
+blueColor = "#1859C4"
+violetColor = "#6E3FD1"
+grayColor = "#5B6B82"
+chartCategoricalColors = [
+    "#1859C4", "#0E7C7B", "#6E3FD1", "#B54708",
+    "#BC3B32", "#067647", "#5B6B82", "#8A5A00",
+]
+chartSequentialColors = [
+    "#EEF3FB", "#D8E4F7", "#B9CFF0", "#95B6E7", "#6E9BDC",
+    "#4A80CE", "#2F66BC", "#1D4FA3", "#153C7E", "#0E2A59",
+]
+
+[theme.light.sidebar]
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#EDF2F8"
+borderColor = "#E1E7EF"
+
+[theme.dark]
+primaryColor = "#5AA0F2"
+backgroundColor = "#0D1421"
+secondaryBackgroundColor = "#161F2E"
+codeBackgroundColor = "#161F2E"
+textColor = "#E7EDF5"
+linkColor = "#7FB6F7"
+borderColor = "#26334A"
+dataframeBorderColor = "#26334A"
+dataframeHeaderBackgroundColor = "#161F2E"
+greenColor = "#3DD68C"
+redColor = "#F17C74"
+yellowColor = "#E8B339"
+orangeColor = "#F0A63D"
+blueColor = "#5AA0F2"
+violetColor = "#A98BF5"
+grayColor = "#93A2B8"
+chartCategoricalColors = [
+    "#5AA0F2", "#3FC5C0", "#A98BF5", "#F0A63D",
+    "#F17C74", "#3DD68C", "#93A2B8", "#D9B25F",
+]
+chartSequentialColors = [
+    "#12203A", "#183050", "#1E4068", "#245181", "#2C639B",
+    "#3776B5", "#4A8ACB", "#619FDD", "#7FB6EC", "#A3CDF7",
+]
+
+[theme.dark.sidebar]
+backgroundColor = "#0A1019"
+secondaryBackgroundColor = "#161F2E"
+borderColor = "#26334A"
+
+[server]
+maxUploadSize = 25
+
+[browser]
+gatherUsageStats = false
